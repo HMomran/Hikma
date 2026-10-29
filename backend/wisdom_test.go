@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -97,7 +98,7 @@ func TestDailyGeminiCacheAndRestart(t *testing.T) {
 	}
 }
 
-func TestGeminiFailuresUseDailyLocalFallback(t *testing.T) {
+func TestGeminiFailuresReturnSafeErrors(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
@@ -117,14 +118,17 @@ func TestGeminiFailuresUseDailyLocalFallback(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, calls := testService(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); fmt.Fprint(w, tc.body) })
-			first, _, err := s.Current(context.Background())
-			if err != nil || !strings.HasPrefix(first, localLabel) {
-				t.Fatalf("missing fallback: %q %v", first, err)
+			first, retry, err := s.Current(context.Background())
+			if err != errWisdomUnavailable || first != "" {
+				t.Fatalf("failure produced wisdom: %q %v", first, err)
+			}
+			if retry.Sub(s.now()) != time.Minute {
+				t.Fatal("missing retry backoff")
 			}
 			for i := 0; i < 3; i++ {
 				message, _, err := s.Current(context.Background())
-				if err != nil || message != first {
-					t.Fatal("fallback changed within a day")
+				if err != errWisdomUnavailable || message != "" {
+					t.Fatal("failure cache returned content")
 				}
 			}
 			if calls.Load() != 1 {
@@ -135,10 +139,12 @@ func TestGeminiFailuresUseDailyLocalFallback(t *testing.T) {
 				t.Fatal(err)
 			}
 			restored.now = s.now
+			restored.client = &http.Client{Transport: forbidNetwork{t}}
 			message, _, err := restored.Current(context.Background())
-			if err != nil || message != first {
-				t.Fatal("fallback was not persisted")
+			if err != errWisdomUnavailable || message != "" {
+				t.Fatal("retry state not persisted")
 			}
+
 		})
 	}
 }
@@ -152,8 +158,8 @@ func TestGeminiTimeoutAndSafeErrors(t *testing.T) {
 	})
 	s.client.Timeout = 20 * time.Millisecond
 	message, _, err := s.Current(context.Background())
-	if err != nil || !strings.HasPrefix(message, localLabel) {
-		t.Fatal("timeout lost fallback")
+	if err != errWisdomUnavailable || message != "" {
+		t.Fatal("timeout did not fail safely")
 	}
 	s.endpoint = "http://127.0.0.1:1/?key=test-key"
 	_, err = s.generate(context.Background())
@@ -162,7 +168,8 @@ func TestGeminiTimeoutAndSafeErrors(t *testing.T) {
 	}
 }
 
-func TestGeminiConfigurationAndNoKeyFallback(t *testing.T) {
+func TestGeminiConfigurationAndMissingKey(t *testing.T) {
+	t.Setenv("HIKMAH_REFRESH_INTERVAL", "")
 	t.Setenv("GEMINI_API_KEY", "")
 	t.Setenv("GEMINI_MODEL", "")
 	t.Setenv("HIKMAH_TIMEZONE", "")
@@ -176,8 +183,8 @@ func TestGeminiConfigurationAndNoKeyFallback(t *testing.T) {
 	}
 	s.client = &http.Client{Transport: forbidNetwork{t}}
 	message, _, err := s.Current(context.Background())
-	if err != nil || !strings.HasPrefix(message, localLabel) {
-		t.Fatal("no-key fallback failed")
+	if err != errWisdomUnavailable || message != "" {
+		t.Fatal("missing key did not fail safely")
 	}
 	t.Setenv("GEMINI_MODEL", "../bad?key=secret")
 	if _, err := newWisdomService(); err == nil {
@@ -212,45 +219,150 @@ func TestTodayHandlerUsesSameDailyWisdom(t *testing.T) {
 		t.Fatal("invalid API response")
 	}
 	// This is the same method used by welcome and scheduled push notifications.
-	message, _, err := s.Current(context.Background())
-	if err != nil || message != response.Message || calls.Load() != 1 {
+	notif, err := currentWisdomNotification(context.Background())
+	if err != nil || notif.Message != response.Message || calls.Load() != 1 {
 		t.Fatal("page and notifications diverged")
 	}
 }
 
 func TestMinuteRotation(t *testing.T) {
-	for _, fallback := range []bool{false, true} {
-		t.Run(fmt.Sprint(fallback), func(t *testing.T) {
-			count := 0
-			s, calls := testService(t, func(w http.ResponseWriter, r *http.Request) {
-				count++
-				if fallback {
-					w.WriteHeader(429)
-					return
-				}
-				text := testReflection
-				if count > 1 {
-					text = "باللطف وحسن الاستماع تبني جسور الثقة بينك وبين الآخرين."
-				}
-				fmt.Fprint(w, geminiResponse(text, "STOP"))
-			})
-			s.refreshInterval = time.Minute
-			now := s.now()
-			s.now = func() time.Time { return now }
-			first, next, err := s.Current(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			now = now.Add(30 * time.Second)
-			same, _, _ := s.Current(context.Background())
-			if same != first || calls.Load() != 1 {
-				t.Fatal("cache not shared within minute")
-			}
-			now = next
-			second, _, err := s.Current(context.Background())
-			if err != nil || second == first || calls.Load() != 2 {
-				t.Fatal("wisdom did not change after minute")
-			}
-		})
+	count := 0
+	s, calls := testService(t, func(w http.ResponseWriter, r *http.Request) {
+		count++
+		text := testReflection
+		if count > 1 {
+			text = "باللطف وحسن الاستماع تبني جسور الثقة بينك وبين الآخرين."
+		}
+		fmt.Fprint(w, geminiResponse(text, "STOP"))
+	})
+	s.refreshInterval = time.Minute
+	now := s.now()
+	s.now = func() time.Time { return now }
+	first, next, err := s.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Second)
+	same, _, err := s.Current(context.Background())
+	if err != nil || same != first || calls.Load() != 1 {
+		t.Fatal("cache not shared within minute")
+	}
+	now = next
+	second, _, err := s.Current(context.Background())
+	if err != nil || second == first || calls.Load() != 2 {
+		t.Fatal("AI wisdom did not refresh after minute")
+	}
+}
+
+func TestFailedRefreshPreservesLastAIAndRecovers(t *testing.T) {
+	var unavailable atomic.Bool
+	s, calls := testService(t, func(w http.ResponseWriter, r *http.Request) {
+		if unavailable.Load() {
+			w.WriteHeader(429)
+			return
+		}
+		text := testReflection
+		if callsText := r.Header.Get("x-goog-api-key"); callsText == "recovered-key" {
+			text = "باللطف وحسن الاستماع تبني جسور الثقة بينك وبين الآخرين."
+		}
+		fmt.Fprint(w, geminiResponse(text, "STOP"))
+	})
+	now := s.now()
+	s.now = func() time.Time { return now }
+	first, _, err := s.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(s.cacheFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailable.Store(true)
+	now = now.AddDate(0, 0, 1)
+	message, retry, err := s.Current(context.Background())
+	if err != nil || message != first || s.cached.Day == now.Format("2006-01-02") {
+		t.Fatal("failed refresh overwrote AI cache")
+	}
+	if calls.Load() != 2 {
+		t.Fatal("unexpected request count")
+	}
+	_, _, _ = s.Current(context.Background())
+	if calls.Load() != 2 {
+		t.Fatal("stale cache caused repeated requests")
+	}
+	saved, err := os.ReadFile(s.cacheFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after dailyWisdom
+	_ = json.Unmarshal(original, &before)
+	_ = json.Unmarshal(saved, &after)
+	if before.Message != after.Message || before.Day != after.Day {
+		t.Fatal("last AI success lost from disk")
+	}
+	restored, err := newWisdomService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored.now = s.now
+	restored.client = &http.Client{Transport: forbidNetwork{t}}
+	message, _, err = restored.Current(context.Background())
+	if err != nil || message != first {
+		t.Fatal("stale AI or backoff lost on restart")
+	}
+	now = retry
+	_, secondRetry, err := s.Current(context.Background())
+	if err != nil || secondRetry.Sub(now) != 2*time.Minute {
+		t.Fatal("backoff did not increase")
+	}
+	now = secondRetry
+	unavailable.Store(false)
+	s.apiKey = "recovered-key"
+	message, _, err = s.Current(context.Background())
+	if err != nil || message == first || s.cached.Failures != 0 || !s.cached.RetryAfter.IsZero() {
+		t.Fatal("AI did not recover")
+	}
+}
+
+func TestUnvalidatedDiskCacheIsNotServed(t *testing.T) {
+	s, _ := testService(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+	data, _ := json.Marshal(dailyWisdom{Day: s.now().Format("2006-01-02"), Timezone: s.location.String(), Message: "untrusted cached content"})
+	if err := os.WriteFile(s.cacheFile, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := newWisdomService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored.now = s.now
+	restored.endpoint = s.endpoint
+	restored.client = s.client
+	message, _, err := restored.Current(context.Background())
+	if err != errWisdomUnavailable || message != "" {
+		t.Fatal("unvalidated disk cache was served")
+	}
+}
+
+func TestWebsiteAndNotificationsFailSafely(t *testing.T) {
+	s, calls := testService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		fmt.Fprint(w, `{"error":{"message":"private test-key provider details"}}`)
+	})
+	old := wisdomService
+	wisdomService = s
+	t.Cleanup(func() { wisdomService = old })
+	recorder := httptest.NewRecorder()
+	todayHandler(recorder, httptest.NewRequest(http.MethodGet, "/api/hikmah", nil))
+	if recorder.Code != 503 || recorder.Header().Get("Retry-After") == "" || !strings.Contains(recorder.Body.String(), "temporarily unavailable") || strings.Contains(recorder.Body.String(), "test-key") || strings.Contains(recorder.Body.String(), "429") {
+		t.Fatal("unsafe HTTP failure")
+	}
+	notif, err := currentWisdomNotification(context.Background())
+	if err == nil || notif.Message != "" || calls.Load() != 1 {
+		t.Fatal("unavailable AI generated a notification or extra API request")
+	}
+	for _, message := range []string{"", "invalid", aiLabel + "invalid"} {
+		if err := sendPushNotification(nil, Notification{Message: message}); err == nil {
+			t.Fatal("invalid notification accepted")
+		}
 	}
 }

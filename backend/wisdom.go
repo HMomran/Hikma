@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,25 +20,22 @@ import (
 	"unicode/utf8"
 )
 
-// Keep the original collection separate from generated reflections and available
-// in deployed binaries. These entries have no independently verified citations.
-//
-//go:embed data/hikmah.json
-var localWisdomJSON []byte
-
 const aiLabel = "تأمل مولّد بالذكاء الاصطناعي: "
-const localLabel = "من المجموعة المحلية (دون نسبة موثّقة): "
+
+var errWisdomUnavailable = errors.New("wisdom is temporarily unavailable")
 
 var modelNamePattern = regexp.MustCompile(`^gemini-[a-zA-Z0-9.-]+$`)
 
 type dailyWisdom struct {
-	Day      string `json:"day"`
-	Timezone string `json:"timezone"`
-	Message  string `json:"message"`
+	Day        string    `json:"day"`
+	Timezone   string    `json:"timezone"`
+	Message    string    `json:"message"`
+	RetryAfter time.Time `json:"retryAfter,omitempty"`
+	Failures   int       `json:"failures,omitempty"`
 }
 
 // One shared result per calendar day, for both the website and push delivery.
-// A fallback also lasts the whole day: provider failures never cause retry storms.
+// Only validated Gemini text is cached; failed refreshes retain the last success.
 type WisdomService struct {
 	mu                      sync.Mutex
 	client                  *http.Client
@@ -46,7 +43,6 @@ type WisdomService struct {
 	location                *time.Location
 	refreshInterval         time.Duration
 	now                     func() time.Time
-	fallback                []string
 	cacheFile               string
 	cached                  dailyWisdom
 }
@@ -74,10 +70,6 @@ func newWisdomService() (*WisdomService, error) {
 			return nil, fmt.Errorf("HIKMAH_REFRESH_INTERVAL must be between 1m and 24h")
 		}
 	}
-	var fallback []string
-	if err := json.Unmarshal(localWisdomJSON, &fallback); err != nil || len(fallback) == 0 {
-		return nil, fmt.Errorf("invalid embedded local wisdom collection")
-	}
 	cacheFile := os.Getenv("HIKMAH_CACHE_FILE")
 	if cacheFile == "" {
 		cacheFile = ".cache/daily-hikmah.json"
@@ -86,12 +78,12 @@ func newWisdomService() (*WisdomService, error) {
 		client: &http.Client{Timeout: 30 * time.Second},
 		apiKey: strings.TrimSpace(os.Getenv("GEMINI_API_KEY")), model: model,
 		endpoint: "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
-		location: location, refreshInterval: refreshInterval, now: time.Now, fallback: fallback, cacheFile: cacheFile,
+		location: location, refreshInterval: refreshInterval, now: time.Now, cacheFile: cacheFile,
 	}
-	// A missing key is supported: the local daily fallback works without network.
+	// Restore validated AI content and retry state without changing subscription data.
 	if data, err := os.ReadFile(cacheFile); err == nil {
 		var cached dailyWisdom
-		if json.Unmarshal(data, &cached) == nil && cached.Timezone == zone && validCachedWisdom(cached.Message) {
+		if json.Unmarshal(data, &cached) == nil && cached.Timezone == zone && (validCachedWisdom(cached.Message) || (cached.Message == "" && cached.Day == "")) {
 			s.cached = cached
 		}
 	}
@@ -99,21 +91,7 @@ func newWisdomService() (*WisdomService, error) {
 }
 
 func validCachedWisdom(message string) bool {
-	if strings.HasPrefix(message, aiLabel) {
-		return validateReflection(strings.TrimPrefix(message, aiLabel)) == nil
-	}
-	if strings.HasPrefix(message, localLabel) {
-		var collection []string
-		if json.Unmarshal(localWisdomJSON, &collection) != nil {
-			return false
-		}
-		for _, item := range collection {
-			if message == localLabel+item {
-				return true
-			}
-		}
-	}
-	return false
+	return strings.HasPrefix(message, aiLabel) && validateReflection(strings.TrimPrefix(message, aiLabel)) == nil
 }
 
 func (s *WisdomService) Current(ctx context.Context) (string, time.Time, error) {
@@ -123,39 +101,56 @@ func (s *WisdomService) Current(ctx context.Context) (string, time.Time, error) 
 	day := now.Format("2006-01-02")
 	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, s.location)
 	next := midnight.AddDate(0, 0, 1)
-	ordinal := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix() / 86400
 	if s.refreshInterval > 0 {
 		slot := now.UnixNano() / int64(s.refreshInterval)
 		day = fmt.Sprintf("interval:%d:%d", s.refreshInterval, slot)
 		next = time.Unix(0, (slot+1)*int64(s.refreshInterval)).In(s.location)
-		ordinal = slot
 	}
 	if s.cached.Day == day && s.cached.Message != "" {
 		return s.cached.Message, next, nil
+	}
+	if now.Before(s.cached.RetryAfter) {
+		if validCachedWisdom(s.cached.Message) {
+			return s.cached.Message, s.cached.RetryAfter, nil
+		}
+		return "", s.cached.RetryAfter, errWisdomUnavailable
 	}
 	message, err := s.generate(ctx)
 	if err == nil && aiLabel+message == s.cached.Message {
 		err = fmt.Errorf("Gemini repeated the previous reflection")
 	}
 	if err != nil {
-		// Errors are constructed locally; raw provider responses and keys stay private.
-		log.Printf("Gemini unavailable; using local daily wisdom: %v", err)
-		if len(s.fallback) == 0 {
-			return "", next, fmt.Errorf("local wisdom collection unavailable")
+		// Never replace a successful reflection with failed output. Persist retry
+		// state too so restarting does not reset the provider failure backoff.
+		s.cached.Failures++
+		if s.cached.Failures > 7 {
+			s.cached.Failures = 7
 		}
-		index := int((ordinal%int64(len(s.fallback)) + int64(len(s.fallback))) % int64(len(s.fallback)))
-		message = localLabel + s.fallback[index]
-	} else {
-		message = aiLabel + message
+		delay := time.Minute * time.Duration(1<<(s.cached.Failures-1))
+		if delay > time.Hour {
+			delay = time.Hour
+		}
+		s.cached.RetryAfter = s.now().Add(delay)
+		s.cached.Timezone = s.location.String()
+		log.Printf("Gemini generation unavailable; retry delayed: %v", err)
+		s.persistCache()
+		if validCachedWisdom(s.cached.Message) {
+			return s.cached.Message, s.cached.RetryAfter, nil
+		}
+		return "", s.cached.RetryAfter, errWisdomUnavailable
 	}
+	message = aiLabel + message
 	s.cached = dailyWisdom{Day: day, Timezone: s.location.String(), Message: message}
-	// Disk cache preserves the daily selection across restarts of a single server.
+	s.persistCache()
+	return message, next, nil
+}
+
+func (s *WisdomService) persistCache() {
 	if s.cacheFile != "" {
 		if err := s.saveCache(); err != nil {
-			log.Print("Daily wisdom cache could not be persisted; retaining in-memory cache")
+			log.Print("Wisdom cache could not be persisted; retaining in-memory cache")
 		}
 	}
-	return message, next, nil
 }
 
 func (s *WisdomService) saveCache() error {
@@ -282,8 +277,7 @@ func validateReflection(message string) error {
 		}
 		return unicode.ToLower(r)
 	}, message)
-	// Reject attribution markers and religious names; generated text is never
-	// promoted into the separately maintained historical collection.
+	// Reject unverified religious attribution in generated reflections.
 	for _, phrase := range []string{"الامام", "عليه السلام", "اهل البيت", "اهلالبيت", "قال علي", "عن علي", "علي بن", "نهج البلاغة", "قال رسول", "قال النبي", "قال الله", "حديث", "قران", "ali", "ahlulbayt"} {
 		if strings.Contains(normalized, phrase) {
 			return fmt.Errorf("Gemini returned an unverified religious attribution")

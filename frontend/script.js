@@ -94,6 +94,13 @@ function getSelectedFrequency() {
 async function loadTodaysWisdom() {
   try {
     const response = await fetch(API_URL + "/api/hikmah");
+    if (response.status === 503) {
+      wisdomEl.textContent = "الحكمة غير متاحة مؤقتاً. يرجى المحاولة لاحقاً.";
+      const retrySeconds = Number(response.headers.get("Retry-After")) || 60;
+      clearTimeout(wisdomRefreshTimeout);
+      wisdomRefreshTimeout = setTimeout(loadTodaysWisdom, Math.max(60, Math.min(retrySeconds, 3600)) * 1000);
+      return;
+    }
     if (!response.ok) {
       throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
     }

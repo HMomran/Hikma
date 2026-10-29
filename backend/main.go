@@ -141,8 +141,23 @@ func getVAPIDKeys() error {
 	return nil
 }
 
+// Both scheduled and welcome notifications use the website's validated AI cache.
+func currentWisdomNotification(ctx context.Context) (Notification, error) {
+	message, _, err := wisdomService.Current(ctx)
+	if err != nil {
+		return Notification{}, err
+	}
+	if !validCachedWisdom(message) {
+		return Notification{}, errWisdomUnavailable
+	}
+	return Notification{Title: "حكمة اليوم", Message: message}, nil
+}
+
 // sendPushNotification sends a Web Push notification to a subscriber
 func sendPushNotification(sub *Subscriber, notif Notification) error {
+	if !validCachedWisdom(notif.Message) {
+		return fmt.Errorf("notification requires valid AI-generated wisdom")
+	}
 	payload, err := json.Marshal(notif)
 	if err != nil {
 		return err
@@ -218,14 +233,10 @@ func notificationScheduler() {
 
 			// Check if it's time to send a notification
 			if timeSince >= frequencyDuration {
-				wisdom, _, err := wisdomService.Current(context.Background())
+				notif, err := currentWisdomNotification(context.Background())
 				if err != nil {
-					log.Printf("AI wisdom unavailable: %v", err)
+					log.Print("Skipping notification: wisdom temporarily unavailable")
 					continue
-				}
-				notif := Notification{
-					Title:   "حكمة اليوم",
-					Message: wisdom,
 				}
 
 				if err := sendPushNotification(sub, notif); err != nil {
@@ -260,6 +271,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "3600")
+		w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 
 		// Handle preflight
 		if r.Method == "OPTIONS" {
@@ -308,12 +320,11 @@ func subscribeHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Send immediate welcome notification
 	go func() {
-		wisdom, _, err := wisdomService.Current(context.Background())
+		notif, err := currentWisdomNotification(context.Background())
 		if err != nil {
-			log.Printf("Welcome wisdom unavailable: %v", err)
+			log.Print("Skipping welcome notification: wisdom temporarily unavailable")
 			return
 		}
-		notif := Notification{Title: "حكمة اليوم", Message: wisdom}
 		if err := sendPushNotification(subscriber, notif); err != nil {
 			log.Printf("❌ Failed to send welcome notification: %v", err)
 		} else {
@@ -346,7 +357,12 @@ func todayHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	wisdom, nextRotation, err := wisdomService.Current(r.Context())
 	if err != nil {
-		log.Printf("AI wisdom unavailable: %v", err)
+		retrySeconds := int(time.Until(nextRotation).Seconds()) + 1
+		if retrySeconds < 60 {
+			retrySeconds = 60
+		}
+		w.Header().Set("Retry-After", fmt.Sprint(retrySeconds))
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "Wisdom is temporarily unavailable. Please try again shortly.", http.StatusServiceUnavailable)
 		return
 	}
@@ -373,7 +389,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"status":      "ok",
 		"subscribers": subStore.Count(),
-		"source":      "gemini_or_local",
+		"source":      "gemini",
 		"version":     "1.0.0",
 	}
 
