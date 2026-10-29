@@ -46,3 +46,8 @@ dist/
 # Build artifacts
 build/
 tmp/
+
+# Private environment credentials
+.env
+.env.*
+!.env.example
