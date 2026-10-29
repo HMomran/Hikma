@@ -1,3 +1,5 @@
+> Gemini setup: configure `GEMINI_API_KEY` on the backend before starting. See [Gemini setup](README.md#gemini-setup) for current instructions.
+
 # 🚀 Quick Start - Testing Fixed Version
 
 ## Test Locally (5 minutes)
@@ -5,7 +7,7 @@
 ### 1. Start Backend
 ```bash
 cd backend
-PORT=8080 go run main.go
+PORT=8080 go run .
 ```
 
 **Expected output:**
@@ -14,7 +16,7 @@ PORT=8080 go run main.go
 ✅ Using VAPID keys from environment variables
    (or)
 ⚠️  VAPID keys not found in environment. Generating new ones...
-✅ Loaded 99 sayings from data/hikmah.json
+AI configured using GEMINI_API_KEY
 🚀 Notification scheduler started (checking every hour)
 ✅ Server starting on port 8080
 📡 API endpoints:
@@ -236,8 +238,8 @@ lsof -ti:8080 | xargs kill -9
 **Cause:** Running `go run` from wrong directory  
 **Fix:**
 ```bash
-cd /full/path/to/daily-hikmah/backend
-go run main.go
+cd /full/path/to/Ali/backend
+go run .
 ```
 
 ### Build Error: "package xyz not found"

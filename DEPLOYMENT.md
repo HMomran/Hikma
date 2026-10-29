@@ -1,3 +1,5 @@
+> Gemini setup: configure `GEMINI_API_KEY` on the backend before starting. See [Gemini setup](README.md#gemini-setup) for current instructions.
+
 # ====================================
 # Daily Hikmah - Deployment Guide
 # ====================================
@@ -25,7 +27,7 @@ VAPID keys are required for Web Push authentication. Generate them once before d
 ### Option A: Using the generator script
 
 ```bash
-cd /Users/hassanomran/div/Ali/daily-hikmah
+cd /Users/hassanomran/div/Ali
 go run generate_vapid_keys.go
 ```
 
@@ -34,7 +36,7 @@ This will output your keys. **Save them securely!**
 ### Option B: Run backend once locally
 
 ```bash
-go run main-production.go
+go run .
 ```
 
 The keys will be generated and printed to the console.
@@ -179,7 +181,7 @@ The keys will be generated and printed to the console.
 - **Solution**: Make sure you added `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in Render environment variables
 
 **Issue**: "Failed to load sayings"
-- **Solution**: Ensure `data/hikmah.json` is in your repository and committed
+- **Solution**: Set `GEMINI_API_KEY` in the backend environment
 
 **Issue**: "Port already in use"
 - **Solution**: This won't happen on Render (they assign a dynamic port). Only affects local development.

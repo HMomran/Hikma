@@ -172,7 +172,7 @@ body: JSON.stringify({
 
 ### Step 1: Generate VAPID Keys
 ```bash
-cd /Users/hassanomran/div/Ali/daily-hikmah
+cd /Users/hassanomran/div/Ali
 go run generate_vapid_keys.go
 ```
 **Output:** Public and private VAPID keys → **Save these!**

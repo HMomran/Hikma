@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -106,11 +107,7 @@ var (
 	vapidPublicKey  string
 	vapidPrivateKey string
 	subStore        = &SubscriptionStore{subscribers: make(map[string]*Subscriber)}
-	sayings         []string
-	sayingCounter   int
-	counterMutex    sync.Mutex
-	lastRotation    time.Time // Track when hikmah was last rotated
-	rotationMutex   sync.RWMutex
+	wisdomService   *WisdomService
 )
 
 // getVAPIDKeys loads VAPID keys from environment variables or generates new ones
@@ -138,70 +135,10 @@ func getVAPIDKeys() error {
 
 	log.Println("✅ VAPID keys generated successfully")
 	log.Printf("   Public Key:  %s", publicKey)
-	log.Printf("   Private Key: %s", privateKey)
+	log.Println("   Private key generated (not logged)")
 	log.Println("   ⚠️  Save these keys as environment variables for production!")
 
 	return nil
-}
-
-// loadSayings loads Arabic wisdom from JSON file
-func loadSayings(filename string) error {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("failed to read %s: %v", filename, err)
-	}
-
-	if err := json.Unmarshal(data, &sayings); err != nil {
-		return fmt.Errorf("failed to parse %s: %v", filename, err)
-	}
-
-	if len(sayings) == 0 {
-		return fmt.Errorf("%s contains no sayings", filename)
-	}
-
-	log.Printf("✅ Loaded %d sayings from %s", len(sayings), filename)
-	return nil
-}
-
-// getNextWisdom returns the next wisdom saying in sequence
-func getNextWisdom() string {
-	counterMutex.Lock()
-	defer counterMutex.Unlock()
-
-	wisdom := sayings[sayingCounter%len(sayings)]
-	sayingCounter++
-	return wisdom
-}
-
-// getCurrentWisdom returns the current wisdom without incrementing
-func getCurrentWisdom() string {
-	counterMutex.Lock()
-	defer counterMutex.Unlock()
-
-	return sayings[sayingCounter%len(sayings)]
-}
-
-// rotateWisdomIfNeeded checks if hikmah should rotate (every minute for testing) and rotates it
-func rotateWisdomIfNeeded() {
-	rotationMutex.Lock()
-	defer rotationMutex.Unlock()
-
-	now := time.Now()
-	// If more than 1 minute has passed since last rotation, rotate (for testing)
-	if now.Sub(lastRotation) >= 1*time.Minute {
-		counterMutex.Lock()
-		sayingCounter++
-		counterMutex.Unlock()
-		lastRotation = now
-		log.Printf("🔄 Hikmah rotated to #%d", sayingCounter%len(sayings)+1)
-	}
-}
-
-// getNextRotationTime returns when the next hikmah rotation will happen
-func getNextRotationTime() time.Time {
-	rotationMutex.RLock()
-	defer rotationMutex.RUnlock()
-	return lastRotation.Add(1 * time.Minute)
 }
 
 // sendPushNotification sends a Web Push notification to a subscriber
@@ -281,7 +218,11 @@ func notificationScheduler() {
 
 			// Check if it's time to send a notification
 			if timeSince >= frequencyDuration {
-				wisdom := getNextWisdom()
+				wisdom, _, err := wisdomService.Current(context.Background())
+				if err != nil {
+					log.Printf("AI wisdom unavailable: %v", err)
+					continue
+				}
 				notif := Notification{
 					Title:   "حكمة اليوم",
 					Message: wisdom,
@@ -367,10 +308,12 @@ func subscribeHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Send immediate welcome notification
 	go func() {
-		notif := Notification{
-			Title:   "حكمة اليوم",
-			Message: getCurrentWisdom(),
+		wisdom, _, err := wisdomService.Current(context.Background())
+		if err != nil {
+			log.Printf("Welcome wisdom unavailable: %v", err)
+			return
 		}
+		notif := Notification{Title: "حكمة اليوم", Message: wisdom}
 		if err := sendPushNotification(subscriber, notif); err != nil {
 			log.Printf("❌ Failed to send welcome notification: %v", err)
 		} else {
@@ -397,14 +340,21 @@ func vapidPublicKeyHandler(w http.ResponseWriter, r *http.Request) {
 
 // Handler for GET /today and /api/hikmah
 func todayHandler(w http.ResponseWriter, r *http.Request) {
-	// Check if hikmah needs rotation before serving
-	rotateWisdomIfNeeded()
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	wisdom, nextRotation, err := wisdomService.Current(r.Context())
+	if err != nil {
+		log.Printf("AI wisdom unavailable: %v", err)
+		http.Error(w, "Wisdom is temporarily unavailable. Please try again shortly.", http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	nextRotation := getNextRotationTime()
 	response := map[string]interface{}{
 		"title":        "حكمة اليوم",
-		"message":      getCurrentWisdom(),
+		"message":      wisdom,
 		"nextRotation": nextRotation.Unix(), // Unix timestamp for frontend
 	}
 
@@ -423,7 +373,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"status":      "ok",
 		"subscribers": subStore.Count(),
-		"sayings":     len(sayings),
+		"source":      "gemini_or_local",
 		"version":     "1.0.0",
 	}
 
@@ -442,15 +392,11 @@ func main() {
 		log.Fatalf("❌ VAPID key error: %v", err)
 	}
 
-	// Load wisdom sayings
-	sayingsFile := "data/hikmah.json"
-	if err := loadSayings(sayingsFile); err != nil {
-		log.Fatalf("❌ Failed to load sayings: %v", err)
+	var err error
+	wisdomService, err = newWisdomService()
+	if err != nil {
+		log.Fatalf("AI configuration error: %v", err)
 	}
-
-	// Initialize rotation time
-	lastRotation = time.Now()
-	log.Printf("⏰ Hikmah rotation initialized. Next rotation at: %s", lastRotation.Add(1*time.Hour).Format("15:04:05"))
 
 	// Start notification scheduler in background
 	go notificationScheduler()

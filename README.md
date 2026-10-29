@@ -4,6 +4,68 @@ A production-ready full-stack web application that sends Arabic wisdom notificat
 
 **🚀 [View Production Deployment Guide →](DEPLOYMENT.md)**
 
+## Gemini setup
+
+The backend uses Google's official Gemini `generateContent` REST API. Kimi/Moonshot is no longer used; no new Go dependencies are needed. `GEMINI_API_KEY` stays on the backend and is sent in the `x-goog-api-key` header, never in URLs, frontend code, cache, or logs.
+
+The default model is `gemini-2.5-flash`. Google lists free-tier input/output pricing, but currently restricts 2.5 access to accounts that previously used the model. Your account access cannot be checked without your own Gemini key. If unavailable, select a free-tier text model offered to your project with `GEMINI_MODEL`, for example `gemini-3.5-flash-lite`, which Google also lists with free-tier text generation. Quotas depend on your project. Keep the project on the Free tier for free-tier-only use; the application does not enforce billing settings.
+
+Official references: [2.5 Flash availability](https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash), [pricing](https://ai.google.dev/gemini-api/docs/pricing), [REST API](https://ai.google.dev/api/generate-content).
+
+### Configure locally
+
+1. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey).
+2. From the project root, run `cd backend`. If `.env` does not exist, run `cp .env.example .env`. Preserve existing VAPID values so push subscriptions keep using the same keys.
+3. Edit the ignored `.env`, set `GEMINI_API_KEY=your_key`, and remove obsolete `KIMI_API_KEY`, `KIMI_MODEL`, entries. Optionally configure `GEMINI_MODEL`, `HIKMAH_TIMEZONE` (default `Asia/Bahrain`), and `HIKMAH_CACHE_FILE` (default `.cache/daily-hikmah.json`).
+4. Stop the older backend on port 8080, then start:
+
+```sh
+set -a
+source .env
+set +a
+go run .
+```
+
+The Go server does not load `.env` automatically. Open `http://localhost:8080`. The frontend design, subscription flow, VAPID configuration, and notification frequencies are preserved. On Render, set the same environment variables and build with `go build -o app .` from `backend`.
+
+### Daily wisdom and fallback
+
+The first page view or due notification each calendar day requests one short Arabic reflection about patience, kindness, morality, knowledge, personal growth, or life. All consumers share it until midnight in `HIKMAH_TIMEZONE`. Generation is lazy, on the first request after midnight. AI text is prefixed `تأمل مولّد بالذكاء الاصطناعي:` in both the page and notification payloads.
+
+If the key is missing, the request times out, quota is exhausted, the model is inaccessible, or output is invalid/blocked, the service selects a deterministic daily entry from the unchanged `backend/data/hikmah.json`. Fallback text is prefixed `من المجموعة المحلية (دون نسبة موثّقة):`. This fallback lasts the rest of the day; no automatic retry loop consumes quota. The local JSON is embedded into the binary for reliable deployment.
+
+Both generated and fallback results are cached in memory and saved atomically to the ignored cache file. Retaining that file preserves the day's selection across restarts. Use durable storage for this path in production. If saving fails, memory caching remains active, but restarting may make another API request. Multiple independent backend instances need a shared database and lock to enforce one global daily selection. Changing models or adding a key does not replace an already cached day's selection.
+
+AI reflections are never added to the historical collection. The prompt forbids attribution to Imam Ali (عليه السلام), Ahlulbayt, or religious sources, and validation rejects attribution markers. The existing collection contains no citations and is not claimed to be independently verified. Any verified historical quotations must remain separately curated with their sources; this integration neither verifies nor overwrites them.
+
+### Test locally
+
+From `backend`:
+
+```sh
+go test -race ./...
+go vet ./...
+curl -fsS http://localhost:8080/api/hikmah
+```
+
+Automated tests require no real key and use local mock Gemini servers. They cover request format/authentication, Arabic output, attribution rejection, concurrent caching, Bahrain midnight rollover, restart persistence, missing keys, quota/auth/model/service errors, blocked/malformed/truncated output, timeouts, fallback, and matching website/notification content.
+
+For a live Gemini check, stop the test backend, export your real configuration as above, and use a fresh test cache:
+
+```sh
+HIKMAH_CACHE_FILE=.cache/gemini-live-test.json PORT=8081 go run .
+```
+
+In another terminal run `curl -fsS http://localhost:8081/api/hikmah` twice. With available model access/quota, `message` begins with the AI label; both results match and `nextRotation` is next local midnight. A local label means generation failed: inspect sanitized backend status logs. HTTP 403 indicates access/key restrictions, 404 can indicate model availability, and 429 indicates quota exhaustion. A live call uses your project's quota.
+
+To test local fallback manually without contacting Gemini, stop the test server and run:
+
+```sh
+GEMINI_API_KEY= HIKMAH_CACHE_FILE=.cache/fallback-test.json PORT=8081 go run .
+```
+
+Request that endpoint twice: both responses should be HTTP 200 with the same local wisdom. To repeat selection on the same day, stop the test server and remove only its test cache file before restarting. Using a fresh filename also avoids reusing an earlier fallback. Live account generation has not been verified without your Gemini key.
+
 ---
 
 ## ✨ Features
@@ -15,8 +77,8 @@ A production-ready full-stack web application that sends Arabic wisdom notificat
 ✅ **Frequency Selection** - Users choose 6h, 12h, or 24h intervals  
 
 ### Content & UX
-✅ **99 Arabic Wisdom Sayings** - Loaded from external JSON file  
-✅ **Sequential Rotation** - Counter-based wisdom delivery  
+✅ **AI-generated Arabic Wisdom** - Generated through the Gemini API
+✅ **Cached Wisdom** - Shared across page views and push notifications
 ✅ **Subscribe/Unsubscribe** - Full subscription management  
 ✅ **Smart UI** - Auto-hides instructions when subscribed  
 ✅ **Modern Design** - Responsive gradient UI with RTL support  
@@ -34,7 +96,7 @@ A production-ready full-stack web application that sends Arabic wisdom notificat
 ## 📁 Project Structure
 
 ```
-daily-hikmah/
+Ali/
 ├── main.go                    # Original backend (local development)
 ├── main-production.go         # Production backend with env vars & CORS
 ├── generate_vapid_keys.go     # VAPID key generator utility
@@ -97,8 +159,8 @@ GET    /health                 - Same as /api/health
 
 **Data Flow:**
 1. Loads VAPID keys from environment or generates new ones
-2. Loads 99 Arabic sayings from `data/hikmah.json` on startup
-3. Runs hourly scheduler checking each subscriber
+2. Generates Arabic wisdom through the AI API and caches it for the configured interval
+3. Runs a scheduler every minute checking each subscriber
 4. Sends notification if subscriber's frequency interval has passed
 5. Rotates wisdom counter after each notification
 
@@ -135,7 +197,7 @@ Runs in background, independent of browser state:
 
 1. **Clone and navigate**:
 ```bash
-cd /Users/hassanomran/div/Ali/daily-hikmah
+cd /Users/hassanomran/div/Ali
 ```
 
 2. **Install dependencies**:
@@ -145,7 +207,7 @@ go mod download
 
 3. **Run the backend**:
 ```bash
-go run main.go
+go run .
 ```
 
 4. **Open in browser**:
@@ -231,7 +293,7 @@ Content-Type: application/json
 - Port: `PORT` environment variable (Render compatible)
 - VAPID keys: `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` from environment
 - Broadcast: Per-subscriber frequency (6h, 12h, or 24h)
-- Scheduler: Checks every 1 hour, sends based on individual preferences
+- Scheduler: Checks every minute, sends based on individual preferences
 
 ### Frontend Configuration
 
@@ -281,7 +343,7 @@ Users can choose from:
 🔑 **Solution**: Users must re-subscribe after key changes
 
 ### Notification Scheduling
-🔄 **Scheduler**: Runs every 1 hour (checks all subscribers)  
+🔄 **Scheduler**: Runs every minute (checks all subscribers)
 🔄 **Per-user**: Sends only if their frequency interval has passed  
 🔄 **Wisdom rotation**: Sequential counter-based (1→99, then repeats)  
 🔄 **Welcome message**: Immediate notification on new subscription
@@ -296,7 +358,7 @@ Users can choose from:
 - ✅ Solution: Set `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` in Render environment variables
 
 **"Failed to load sayings"**
-- ✅ Solution: Ensure `data/hikmah.json` is committed to repository
+- ✅ Solution: Set `GEMINI_API_KEY` in the backend environment
 
 **"Port already in use"**
 - ✅ Solution: Kill process using: `lsof -ti:8080 | xargs kill -9`
@@ -408,3 +470,7 @@ Contributions are welcome! Feel free to:
 **🎉 Built with ❤️ for daily wisdom seekers**
 
 **Need help?** Check the [Deployment Guide](DEPLOYMENT.md) for detailed instructions.
+
+### One-minute wisdom testing
+
+Notification frequency and wisdom rotation are separate settings. To refresh the shared wisdom every minute during testing, set `HIKMAH_REFRESH_INTERVAL=1m` in backend `.env`, re-export it, and restart `go run .`. The page follows the server's `nextRotation` automatically. Both AI and local fallback rotate on minute boundaries, with at most one generation attempt per minute per server. This uses more Gemini quota. Remove the setting (and `unset HIKMAH_REFRESH_INTERVAL` in your shell) to restore the default calendar-day behavior. The override applies to all users; the notification frequency selection still controls push delivery only.

@@ -132,24 +132,6 @@ self.addEventListener("notificationclose", (event) => {
 });
 
 // ====================================
-// Fetch Event (Optional Caching)
-// ====================================
-// This intercepts network requests and can provide offline functionality
-self.addEventListener("fetch", (event) => {
-  // For now, just pass through all requests to the network
-  // You can add caching strategies here if needed for offline support
-  
-  // Example: Cache-first strategy for static assets
-  /*
-  event.respondWith(
-    caches.match(event.request).then((response) => {
-      return response || fetch(event.request);
-    })
-  );
-  */
-});
-
-// ====================================
 // Message Event
 // ====================================
 // Handle messages from the main app

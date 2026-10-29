@@ -39,6 +39,7 @@ const countdownEl = document.getElementById("countdown");
 
 let vapidPublicKey = null;
 let countdownInterval = null;
+let wisdomRefreshTimeout = null;
 
 // ====================================
 // Utility Functions
@@ -98,6 +99,11 @@ async function loadTodaysWisdom() {
     }
     const data = await response.json();
     wisdomEl.textContent = data.message || data.body || "لا توجد حكمة متاحة";
+    clearTimeout(wisdomRefreshTimeout);
+    if (Number.isFinite(data.nextRotation)) {
+      const delay = Math.max(1000, data.nextRotation * 1000 - Date.now() + 250);
+      wisdomRefreshTimeout = setTimeout(loadTodaysWisdom, Math.min(delay, 2147483647));
+    }
     
     console.log("✅ Hikmah loaded successfully");
   } catch (error) {
